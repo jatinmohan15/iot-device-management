@@ -2,5 +2,6 @@ node_modules/
 .env
 terraform.tfvars
 passgit/token.txt
-terraform.tfvars
-.env
+certs/
+.terraform/
+.terraform.lock.hcl
