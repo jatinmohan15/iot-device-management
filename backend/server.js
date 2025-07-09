@@ -1,121 +1,116 @@
 const express = require('express');
+require('dotenv').config();
 const { Pool } = require('pg');
-const Redis = require('redis');
 const AWS = require('aws-sdk');
+const redis = require('redis');
 const jwt = require('jsonwebtoken');
-const app = express();
-const port = 3001;
+const bcrypt = require('bcrypt');
 
+const app = express();
 app.use(express.json());
 
-// PostgreSQL (RDS) connection
 const pool = new Pool({
-  user: process.env.DB_USER || 'admin',
-  host: process.env.DB_HOST || 'your-rds-endpoint',
+  host: process.env.RDS_HOST,
+  user: process.env.RDS_USERNAME,
+  password: process.env.RDS_PASSWORD,
   database: 'iot_db',
-  password: process.env.DB_PASSWORD || 'yourpassword',
-  port: 5432,
+  ssl: { ca: require('fs').readFileSync('./certs/rds-global-bundle.pem') }
 });
 
-// Redis (ElastiCache) connection
-const redisClient = Redis.createClient({
-  url: `redis://${process.env.REDIS_HOST || 'your-elasticache-endpoint'}:6379`
-});
-redisClient.connect().catch(console.error);
+const redisClient = redis.createClient({ url: process.env.REDIS_URL });
+redisClient.connect().catch(err => console.error('Redis connection error:', err));
 
-// AWS S3 for audit logs
-const s3 = new AWS.S3({
-  accessKeyId: process.env.AWS_ACCESS_KEY,
-  secretAccessKey: process.env.AWS_SECRET_KEY,
-  region: 'us-east-1',
+AWS.config.update({
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  region: 'us-east-1'
 });
+const s3 = new AWS.S3();
 
-// Middleware for JWT authentication
 const authenticate = (req, res, next) => {
-  const token = req.headers['authorization'];
+  const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
-  jwt.verify(token, 'your-secret-key', (err, decoded) => {
-    if (err) return res.status(401).json({ error: 'Invalid token' });
-    req.user = decoded;
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: 'Invalid token' });
+    req.user = user;
     next();
   });
 };
 
-// Create devices table
-pool.query(`
-  CREATE TABLE IF NOT EXISTS devices (
-    id SERIAL PRIMARY KEY,
-    device_id VARCHAR(50) UNIQUE NOT NULL,
-    type VARCHAR(50),
-    location VARCHAR(100),
-    status VARCHAR(20),
-    last_reading FLOAT
-  )
-`).catch(err => console.error('Table creation error:', err));
-
-// Login endpoint for admins
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
-  if (username === 'admin' && password === 'admin123') { // Replace with secure auth in production
-    const token = jwt.sign({ username }, 'your-secret-key', { expiresIn: '1h' });
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
+    const user = result.rows[0];
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+    const token = jwt.sign({ userId: user.id, username: user.username }, process.env.JWT_SECRET, { expiresIn: '1h' });
     res.json({ token });
-  } else {
-    res.status(401).json({ error: 'Invalid credentials' });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Register a device
 app.post('/api/devices', authenticate, async (req, res) => {
   const { device_id, type, location } = req.body;
   try {
-    await pool.query('INSERT INTO devices (device_id, type, location, status) VALUES ($1, $2, $3, $4)', 
-      [device_id, type, location, 'offline']);
-    // Log to S3
+    console.log('Inserting device:', { device_id, type, location });
+    const result = await pool.query(
+      'INSERT INTO devices (device_id, type, location) VALUES ($1, $2, $3) RETURNING *',
+      [device_id, type, location]
+    );
+    console.log('Database insert result:', result.rows);
+    await redisClient.del('devices').catch(err => console.error('Redis del error:', err));
     await s3.putObject({
-      Bucket: 'your-audit-bucket',
+      Bucket: process.env.S3_BUCKET,
       Key: `audit/${Date.now()}.json`,
-      Body: JSON.stringify({ action: 'register', device_id, user: req.user.username, timestamp: new Date() }),
-    }).promise();
-    res.json({ message: 'Device registered' });
+      Body: JSON.stringify({ action: 'create', device_id, type, location, user: req.user.username, timestamp: new Date() }),
+    }).promise().catch(err => console.error('S3 putObject error:', err));
+    res.status(201).json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('POST /api/devices error:', err);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Update device status/reading
-app.put('/api/devices/:device_id', authenticate, async (req, res) => {
-  const { device_id } = req.params;
-  const { status, last_reading } = req.body;
-  try {
-    await pool.query('UPDATE devices SET status = $1, last_reading = $2 WHERE device_id = $3', 
-      [status, last_reading, device_id]);
-    // Cache in Redis
-    await redisClient.setEx(`device:${device_id}`, 3600, JSON.stringify({ status, last_reading }));
-    // Log to S3
-    await s3.putObject({
-      Bucket: 'your-audit-bucket',
-      Key: `audit/${Date.now()}.json`,
-      Body: JSON.stringify({ action: 'update', device_id, status, last_reading, user: req.user.username, timestamp: new Date() }),
-    }).promise();
-    res.json({ message: 'Device updated' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Get all devices
 app.get('/api/devices', authenticate, async (req, res) => {
   try {
     const cached = await redisClient.get('devices');
-    if (cached) return res.json(JSON.parse(cached));
+    if (cached) {
+      return res.json(JSON.parse(cached));
+    }
     const result = await pool.query('SELECT * FROM devices');
     await redisClient.setEx('devices', 60, JSON.stringify(result.rows));
     res.json(result.rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('GET /api/devices error:', err);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-app.listen(port, () => {
-  console.log(`Backend running on port ${port}`);
+app.put('/api/devices/:device_id', authenticate, async (req, res) => {
+  const { device_id } = req.params;
+  const { status, last_reading } = req.body;
+  try {
+    const result = await pool.query(
+      'UPDATE devices SET status = $1, last_reading = $2, last_updated = CURRENT_TIMESTAMP WHERE device_id = $3 RETURNING *',
+      [status, last_reading, device_id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Device not found' });
+    await redisClient.del('devices').catch(err => console.error('Redis del error:', err));
+    await s3.putObject({
+      Bucket: process.env.S3_BUCKET,
+      Key: `audit/${Date.now()}.json`,
+      Body: JSON.stringify({ action: 'update', device_id, status, last_reading, user: req.user.username, timestamp: new Date() }),
+    }).promise().catch(err => console.error('S3 putObject error:', err));
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('PUT /api/devices error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
