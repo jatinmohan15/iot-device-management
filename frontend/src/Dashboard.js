@@ -8,7 +8,7 @@ ChartJS.register(CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend)
 const Dashboard = () => {
   const [devices, setDevices] = useState([]);
   const [token, setToken] = useState('');
-  const API_URL = 'http://<ALB_DNS_NAME>'; // Replace with ALB DNS name after Step 9.2
+  const API_URL = 'http://iot-backend-alb-1998712882.us-east-1.elb.amazonaws.com'; // Replace with ALB DNS name after Step 9.2
 
   const login = async () => {
     try {

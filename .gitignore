@@ -5,3 +5,4 @@ passgit/token.txt
 certs/
 .terraform/
 .terraform.lock.hcl
+.env
